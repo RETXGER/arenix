@@ -72,13 +72,26 @@ Arenix is a professional-grade, multi-turn adversarial simulation framework for 
 
 ---
 
+## Quick Demo (30 seconds)
+
+```bash
+git clone https://github.com/RETXGER/arenix.git
+cd arenix
+pip install -r requirements.txt
+python main_engine.py
+```
+
+No API key needed — runs in mock mode by default.
+
+---
+
 ## Installation
 
 **Requirements:** Python 3.11 or 3.12
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/arenix.git
+git clone https://github.com/RETXGER/arenix.git
 cd arenix
 
 # Create and activate a virtual environment
