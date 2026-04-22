@@ -6,8 +6,10 @@ REST API üzerinden yönetir.
 """
 
 import asyncio
+import contextlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -64,8 +66,14 @@ if HAS_FASTAPI:
             key = self.target_api_key or atk_key
             return prov, model, key
 
+    class TournamentModelConfig(BaseModel):
+        provider: str = Field(..., description="Model provider")
+        model_name: str = Field(..., description="Model name")
+        api_key: Optional[str] = Field(None, description="Provider API key")
+        base_url: Optional[str] = Field(None, description="Custom provider base URL")
+
     class TournamentConfig(BaseModel):
-        models: List[Dict[str, str]] = Field(..., description="[{provider, model_name, api_key?}] listesi")
+        models: List[TournamentModelConfig] = Field(..., description="[{provider, model_name, api_key?, base_url?}] listesi")
         turns: int = Field(10, ge=1, le=50)
         industry: str = Field("default")
         attack_profile: str = Field("balanced", description="Saldırı profili: soft, balanced, aggressive, compliance")
@@ -101,6 +109,7 @@ if HAS_FASTAPI:
     _run_events: Dict[str, List[Dict[str, Any]]] = {}  # WebSocket için canlı olaylar
     _run_created_at: Dict[str, float] = {}
     _runs_lock = threading.RLock()
+    _provider_env_lock = threading.RLock()
     _RUN_TTL_SECONDS = int(os.getenv("ARENIX_RUN_TTL_SECONDS", "86400"))
 
     _SUPPORTED_PROVIDERS = ["gemini", "openai", "anthropic", "deepseek", "ollama", "custom", "mock"]
@@ -143,15 +152,101 @@ if HAS_FASTAPI:
 
     def _set_api_key_env(provider: str, api_key: Optional[str]) -> None:
         """Kullanıcıdan gelen API anahtarını geçici olarak çevre değişkenine yazar."""
+        provider = (provider or "").strip().lower()
         if api_key:
             if provider == "custom":
                 os.environ["ARENIX_CUSTOM_API_KEY"] = api_key
+            elif provider == "gemini":
+                os.environ["GEMINI_API_KEY"] = api_key
+                os.environ["GOOGLE_API_KEY"] = api_key
             else:
                 os.environ[f"{provider.upper()}_API_KEY"] = api_key
 
     def _set_custom_base_url_env(base_url: Optional[str]) -> None:
         if base_url and base_url.strip():
             os.environ["ARENIX_CUSTOM_BASE_URL"] = base_url.strip()
+
+    def _provider_env_overrides(provider: str, api_key: Optional[str], base_url: Optional[str] = None) -> Dict[str, str]:
+        provider = (provider or "").strip().lower()
+        overrides: Dict[str, str] = {}
+        if api_key:
+            if provider == "custom":
+                overrides["ARENIX_CUSTOM_API_KEY"] = api_key
+            elif provider == "gemini":
+                overrides["GEMINI_API_KEY"] = api_key
+                overrides["GOOGLE_API_KEY"] = api_key
+            else:
+                overrides[f"{provider.upper()}_API_KEY"] = api_key
+        if provider == "custom" and base_url and base_url.strip():
+            overrides["ARENIX_CUSTOM_BASE_URL"] = base_url.strip()
+        return overrides
+
+    @contextlib.contextmanager
+    def _temporary_env(overrides: Dict[str, str]):
+        """
+        Apply environment overrides for one run and restore afterwards.
+        Protected by a lock to avoid cross-run env races.
+        """
+        with _provider_env_lock:
+            previous: Dict[str, Optional[str]] = {k: os.environ.get(k) for k in overrides}
+            try:
+                for key, value in overrides.items():
+                    os.environ[key] = value
+                yield
+            finally:
+                for key, old_value in previous.items():
+                    if old_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old_value
+
+    def _validate_provider(provider: str, field_name: str) -> str:
+        normalized = (provider or "").strip().lower()
+        if normalized not in _SUPPORTED_PROVIDERS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name} geçersiz: {provider}. Desteklenenler: {', '.join(_SUPPORTED_PROVIDERS)}"
+            )
+        return normalized
+
+    def _validate_non_empty_model(model_name: str, field_name: str) -> str:
+        normalized = (model_name or "").strip()
+        if not normalized:
+            raise HTTPException(status_code=422, detail=f"{field_name} boş olamaz")
+        return normalized
+
+    def _validate_attack_profile(attack_profile: str) -> str:
+        normalized = (attack_profile or "").strip().lower()
+        supported = {"soft", "balanced", "aggressive", "compliance"}
+        if normalized not in supported:
+            raise HTTPException(
+                status_code=422,
+                detail=f"attack_profile geçersiz: {attack_profile}. Desteklenenler: {', '.join(sorted(supported))}"
+            )
+        return normalized
+
+    def _sanitize_error_message(message: str) -> str:
+        """
+        Redact likely API credentials from exception text before persisting.
+        """
+        text = str(message or "")
+        if not text:
+            return text
+
+        patterns = [
+            # OpenAI-style keys
+            r"sk-[A-Za-z0-9_\-]{10,}",
+            # Anthropic-style keys
+            r"sk-ant-[A-Za-z0-9_\-]{10,}",
+            # Google/Gemini keys
+            r"AIza[0-9A-Za-z\-_]{20,}",
+            # Generic bearer-like values
+            r"Bearer\s+[A-Za-z0-9\.\-_]{12,}",
+        ]
+        redacted = text
+        for pattern in patterns:
+            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+        return redacted
 
     def _resolve_model_ref(model_ref: str) -> tuple[str, str]:
         """model alanını provider/model formatına normalize eder."""
@@ -196,14 +291,21 @@ if HAS_FASTAPI:
         try:
             atk_prov, atk_model, atk_key = config.resolved_attacker()
             tgt_prov, tgt_model, tgt_key = config.resolved_target()
-
-            _set_api_key_env(atk_prov, atk_key)
-            if tgt_prov != atk_prov:
-                _set_api_key_env(tgt_prov, tgt_key)
-            if atk_prov == "custom":
-                _set_custom_base_url_env(config.attacker_base_url)
-            if tgt_prov == "custom":
-                _set_custom_base_url_env(config.target_base_url or config.attacker_base_url)
+            env_overrides: Dict[str, str] = {}
+            env_overrides.update(
+                _provider_env_overrides(
+                    atk_prov,
+                    atk_key,
+                    config.attacker_base_url if atk_prov == "custom" else None,
+                )
+            )
+            env_overrides.update(
+                _provider_env_overrides(
+                    tgt_prov,
+                    tgt_key,
+                    (config.target_base_url or config.attacker_base_url) if tgt_prov == "custom" else None,
+                )
+            )
 
             _push_event(run_id, {"type": "start", "attacker": f"{atk_prov}/{atk_model}", "target": f"{tgt_prov}/{tgt_model}"})
 
@@ -222,43 +324,44 @@ if HAS_FASTAPI:
                 max_turns=config.turns,
             )
 
-            attacker_adapter = build_adapter(atk_prov, atk_model)
-            target_adapter = build_adapter(tgt_prov, tgt_model)
-            observer_adapter = build_adapter(atk_prov, atk_model)
+            with _temporary_env(env_overrides):
+                attacker_adapter = build_adapter(atk_prov, atk_model)
+                target_adapter = build_adapter(tgt_prov, tgt_model)
+                observer_adapter = build_adapter(atk_prov, atk_model)
 
-            tracker = ContextTracker()
-            analyzer_engine = ArenixAnalyzerV2(industry=config.industry)
+                tracker = ContextTracker()
+                analyzer_engine = ArenixAnalyzerV2(industry=config.industry)
 
-            attacker = AttackerRole(attacker_adapter, max_retries=3, profile=config.attack_profile)
-            target = TargetRole(target_adapter, max_retries=3)
-            analyzer = AnalyzerRole(analyzer_engine, tracker=tracker)
-            observer = ObserverRole(observer_adapter, max_retries=3)
+                attacker = AttackerRole(attacker_adapter, max_retries=3, profile=config.attack_profile)
+                target = TargetRole(target_adapter, max_retries=3)
+                analyzer = AnalyzerRole(analyzer_engine, tracker=tracker)
+                observer = ObserverRole(observer_adapter, max_retries=3)
 
-            def _on_turn(event: Dict[str, Any]) -> None:
-                turn_num = int(event.get("turn", 0) or 0)
-                with _runs_lock:
-                    r = _runs.get(run_id)
-                    if r:
-                        r.progress = turn_num
-                _push_event(run_id, {
-                    "type": "turn",
-                    "turn": turn_num,
-                    "compromise_score": event.get("compromise_score", 0),
-                    "resilience_score": event.get("resilience_score", 0),
-                    "status": event.get("status", ""),
-                })
+                def _on_turn(event: Dict[str, Any]) -> None:
+                    turn_num = int(event.get("turn", 0) or 0)
+                    with _runs_lock:
+                        r = _runs.get(run_id)
+                        if r:
+                            r.progress = turn_num
+                    _push_event(run_id, {
+                        "type": "turn",
+                        "turn": turn_num,
+                        "compromise_score": event.get("compromise_score", 0),
+                        "resilience_score": event.get("resilience_score", 0),
+                        "status": event.get("status", ""),
+                    })
 
-            orchestrator = Orchestrator(
-                config=session_cfg,
-                attacker=attacker,
-                target=target,
-                analyzer=analyzer,
-                observer=observer,
-                tracker=tracker,
-                on_turn=_on_turn,
-            )
+                orchestrator = Orchestrator(
+                    config=session_cfg,
+                    attacker=attacker,
+                    target=target,
+                    analyzer=analyzer,
+                    observer=observer,
+                    tracker=tracker,
+                    on_turn=_on_turn,
+                )
 
-            report = orchestrator.run()
+                report = orchestrator.run()
             analysis_report = report.get("analysis_report", report)
 
             result: Dict[str, Any] = {"report": report}
@@ -289,7 +392,7 @@ if HAS_FASTAPI:
                 if run is None:
                     return
                 run.status = "failed"
-                run.error = str(exc)
+                run.error = _sanitize_error_message(str(exc))
         finally:
             with _runs_lock:
                 run = _runs.get(run_id)
@@ -428,6 +531,16 @@ if HAS_FASTAPI:
         """
         atk_prov, atk_model, _ = config.resolved_attacker()
         tgt_prov, tgt_model, _ = config.resolved_target()
+        atk_prov = _validate_provider(atk_prov, "attacker_provider")
+        tgt_prov = _validate_provider(tgt_prov, "target_provider")
+        atk_model = _validate_non_empty_model(atk_model, "attacker_model")
+        tgt_model = _validate_non_empty_model(tgt_model, "target_model")
+        _validate_attack_profile(config.attack_profile)
+
+        if atk_prov == "custom" and not (config.attacker_base_url or "").strip():
+            raise HTTPException(status_code=422, detail="Custom attacker için attacker_base_url zorunlu")
+        if tgt_prov == "custom" and not ((config.target_base_url or config.attacker_base_url or "").strip()):
+            raise HTTPException(status_code=422, detail="Custom target için target_base_url veya attacker_base_url zorunlu")
 
         run_id = str(uuid.uuid4())[:8]
         run = RunStatus(
@@ -527,6 +640,16 @@ if HAS_FASTAPI:
     @app.post("/api/v1/tournament", tags=["Turnuva"])
     async def start_tournament(config: TournamentConfig, background_tasks: BackgroundTasks):
         """Turnuva başlatır — birden fazla modeli aynı senaryoda test eder."""
+        _validate_attack_profile(config.attack_profile)
+        if not config.models:
+            raise HTTPException(status_code=422, detail="Turnuva için en az bir model gerekli")
+
+        for idx, model_cfg in enumerate(config.models, start=1):
+            provider = _validate_provider(model_cfg.provider, f"models[{idx}].provider")
+            _validate_non_empty_model(model_cfg.model_name, f"models[{idx}].model_name")
+            if provider == "custom" and not (model_cfg.base_url or "").strip():
+                raise HTTPException(status_code=422, detail=f"models[{idx}] custom provider için base_url zorunlu")
+
         run_id = f"tourn-{str(uuid.uuid4())[:6]}"
         run = RunStatus(run_id=run_id, status="pending", total_turns=config.turns)
         _cleanup_runs()
@@ -552,12 +675,10 @@ if HAS_FASTAPI:
             try:
                 reports = {}
                 for model_cfg in config.models:
-                    provider = model_cfg["provider"]
-                    model_name = model_cfg["model_name"]
-                    api_key = model_cfg.get("api_key")
+                    provider = model_cfg.provider.strip().lower()
+                    model_name = model_cfg.model_name.strip()
+                    api_key = model_cfg.api_key
                     mid = f"{provider}/{model_name}"
-
-                    _set_api_key_env(provider, api_key)
 
                     session_cfg = SessionConfig(
                         session_id=str(uuid.uuid4()),
@@ -574,28 +695,34 @@ if HAS_FASTAPI:
                         max_turns=config.turns,
                     )
 
-                    attacker_adapter = build_adapter(provider, model_name)
-                    target_adapter = build_adapter(provider, model_name)
-                    observer_adapter = build_adapter(provider, model_name)
-
-                    tracker = ContextTracker()
-                    analyzer_engine = ArenixAnalyzerV2(industry=config.industry)
-
-                    attacker = AttackerRole(attacker_adapter, max_retries=3, profile=config.attack_profile)
-                    target = TargetRole(target_adapter, max_retries=3)
-                    analyzer = AnalyzerRole(analyzer_engine, tracker=tracker)
-                    observer = ObserverRole(observer_adapter, max_retries=3)
-
-                    orchestrator = Orchestrator(
-                        config=session_cfg,
-                        attacker=attacker,
-                        target=target,
-                        analyzer=analyzer,
-                        observer=observer,
-                        tracker=tracker,
+                    env_overrides = _provider_env_overrides(
+                        provider,
+                        api_key,
+                        model_cfg.base_url if provider == "custom" else None,
                     )
+                    with _temporary_env(env_overrides):
+                        attacker_adapter = build_adapter(provider, model_name)
+                        target_adapter = build_adapter(provider, model_name)
+                        observer_adapter = build_adapter(provider, model_name)
 
-                    report = orchestrator.run()
+                        tracker = ContextTracker()
+                        analyzer_engine = ArenixAnalyzerV2(industry=config.industry)
+
+                        attacker = AttackerRole(attacker_adapter, max_retries=3, profile=config.attack_profile)
+                        target = TargetRole(target_adapter, max_retries=3)
+                        analyzer = AnalyzerRole(analyzer_engine, tracker=tracker)
+                        observer = ObserverRole(observer_adapter, max_retries=3)
+
+                        orchestrator = Orchestrator(
+                            config=session_cfg,
+                            attacker=attacker,
+                            target=target,
+                            analyzer=analyzer,
+                            observer=observer,
+                            tracker=tracker,
+                        )
+
+                        report = orchestrator.run()
                     reports[mid] = report.get("analysis_report", report)
 
                 engine = TournamentEngine()
@@ -612,7 +739,7 @@ if HAS_FASTAPI:
                     if run_obj is None:
                         return
                     run_obj.status = "failed"
-                    run_obj.error = str(exc)
+                    run_obj.error = _sanitize_error_message(str(exc))
             finally:
                 with _runs_lock:
                     run_obj = _runs.get(run_id)
@@ -633,6 +760,7 @@ if HAS_FASTAPI:
                 raise HTTPException(status_code=409, detail="Çalışan test silinemez")
             del _runs[run_id]
             _run_created_at.pop(run_id, None)
+            _run_events.pop(run_id, None)
         return {"deleted": run_id}
 
     # ============================================================
