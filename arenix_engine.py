@@ -1,14 +1,16 @@
 import os
 import re
+import sys
 import json
 import time
 import math
 import uuid
 import importlib
 from abc import ABC, abstractmethod
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass
 from collections import deque
 
 # Yeni modüller (opsiyonel import)
@@ -3819,9 +3821,51 @@ class Orchestrator:
 # EXPORT
 # ============================================================
 
+
+def _make_json_safe(obj: Any) -> Any:
+    """Recursively coerce dataclass, Enum, datetime, tuples/sets into JSON-serializable values."""
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value if hasattr(obj, "value") else str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    if isinstance(obj, ArenixReport):
+        return _make_json_safe(obj.to_dict())
+    if is_dataclass(obj):
+        return _make_json_safe(asdict(obj))
+    if isinstance(obj, dict):
+        return {str(k): _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_safe(x) for x in obj]
+    if isinstance(obj, set):
+        return [_make_json_safe(x) for x in sorted(obj, key=lambda x: str(type(x).__name__) + repr(x))]
+    raise TypeError(f"Object not JSON-serializable: {type(obj).__name__}")
+
+
 def export_json(payload: Dict[str, Any], path: str) -> None:
+    safe = _make_json_safe(payload)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(safe, f, ensure_ascii=False, indent=2)
+
+
+def _safe_console_print(line: str, *, end: str = "\n", file=None) -> None:
+    """Write to stdout (or ``file``) without failing on emoji/Unicode under cp1254 / strict codecs."""
+    out = sys.stdout if file is None else file
+    chunk = line + end
+    try:
+        out.write(chunk)
+        if hasattr(out, "flush"):
+            out.flush()
+    except UnicodeEncodeError:
+        enc = getattr(out, "encoding", None) or "ascii"
+        out.write(chunk.encode(enc, errors="replace").decode(enc))
+        if hasattr(out, "flush"):
+            out.flush()
 
 
 def print_summary(payload: Dict[str, Any]) -> None:
@@ -3829,44 +3873,44 @@ def print_summary(payload: Dict[str, Any]) -> None:
     session = payload["session"]
     industry_info = IndustryThresholds.get(session.get("industry", "default"))
 
-    print("\n" + "=" * 84)
-    print("🔥 ARENIX AI SECURITY ANALYSIS REPORT")
-    print("=" * 84)
-    print(f"Session ID: {session['session_id']}")
-    print(f"Industry Profile: {industry_info.get('name', 'Default')}")
-    print(f"Semantic Analysis: {'✅ Enabled' if session.get('enable_semantic_analysis') else '❌ Disabled'}")
-    print(f"Status: {report['status']}")
-    print(f"Attack Detected: {report['attack_detected']}")
-    print(f"Model Compromised: {report['model_compromised']}")
-    print(f"Model Under Pressure: {report.get('model_under_pressure', False)}")
-    print(f"Total Turns: {report['total_turns']}")
-    print(f"Overall Attack Pressure: {report['overall_attack_pressure']}")
-    print(f"Overall Compromise Score: {report['overall_compromise_score']}")
-    print(f"Max Compromise Score: {report['max_compromise_score']}")
-    print(f"Average Resilience: {report['average_resilience']}")
-    print(f"Confidence Score: {report['confidence_score']}")
-    print(f"Vulnerability Level: {report['vulnerability_level']}")
-    print(f"Total Latency: {report.get('total_latency_ms', 0)}ms")
-    print(f"Total Tokens: {report.get('total_tokens', 0)}")
+    _safe_console_print("\n" + "=" * 84)
+    _safe_console_print("🔥 ARENIX AI SECURITY ANALYSIS REPORT")
+    _safe_console_print("=" * 84)
+    _safe_console_print(f"Session ID: {session['session_id']}")
+    _safe_console_print(f"Industry Profile: {industry_info.get('name', 'Default')}")
+    _safe_console_print(f"Semantic Analysis: {'✅ Enabled' if session.get('enable_semantic_analysis') else '❌ Disabled'}")
+    _safe_console_print(f"Status: {report['status']}")
+    _safe_console_print(f"Attack Detected: {report['attack_detected']}")
+    _safe_console_print(f"Model Compromised: {report['model_compromised']}")
+    _safe_console_print(f"Model Under Pressure: {report.get('model_under_pressure', False)}")
+    _safe_console_print(f"Total Turns: {report['total_turns']}")
+    _safe_console_print(f"Overall Attack Pressure: {report['overall_attack_pressure']}")
+    _safe_console_print(f"Overall Compromise Score: {report['overall_compromise_score']}")
+    _safe_console_print(f"Max Compromise Score: {report['max_compromise_score']}")
+    _safe_console_print(f"Average Resilience: {report['average_resilience']}")
+    _safe_console_print(f"Confidence Score: {report['confidence_score']}")
+    _safe_console_print(f"Vulnerability Level: {report['vulnerability_level']}")
+    _safe_console_print(f"Total Latency: {report.get('total_latency_ms', 0)}ms")
+    _safe_console_print(f"Total Tokens: {report.get('total_tokens', 0)}")
 
     if report["break_point"]:
         bp = report["break_point"]
-        print("\n💥 BREAK POINT DETECTED")
-        print(f"Turn: {bp['turn_number']}")
-        print(f"Attack Pressure: {bp['attack_pressure_score']}")
-        print(f"Defense Failure: {bp['defense_failure_score']}")
-        print(f"Compromise Score: {bp['compromise_score']}")
-        print(f"Attack Types: {', '.join(bp['attack_types'])}")
-        print(f"Why Broken: {bp['why_broken']}")
-        print(f"Observer Confirmed: {bp.get('observer_confirmed', False)}")
+        _safe_console_print("\n💥 BREAK POINT DETECTED")
+        _safe_console_print(f"Turn: {bp['turn_number']}")
+        _safe_console_print(f"Attack Pressure: {bp['attack_pressure_score']}")
+        _safe_console_print(f"Defense Failure: {bp['defense_failure_score']}")
+        _safe_console_print(f"Compromise Score: {bp['compromise_score']}")
+        _safe_console_print(f"Attack Types: {', '.join(bp['attack_types'])}")
+        _safe_console_print(f"Why Broken: {bp['why_broken']}")
+        _safe_console_print(f"Observer Confirmed: {bp.get('observer_confirmed', False)}")
         if bp.get("observer_reason"):
-            print(f"Observer Reason: {bp['observer_reason']}")
+            _safe_console_print(f"Observer Reason: {bp['observer_reason']}")
     else:
-        print("\n✅ BREAK POINT: None detected")
+        _safe_console_print("\n✅ BREAK POINT: None detected")
 
-    print("\n📈 TURN EVOLUTION")
+    _safe_console_print("\n📈 TURN EVOLUTION")
     for r in payload["turn_records"]:
-        print(
+        _safe_console_print(
             f"Turn {r['turn_id']}: "
             f"Attack={r['attack_pressure']:5.1f} | "
             f"Compromise={r['compromise_score']:5.1f} | "
@@ -3875,30 +3919,30 @@ def print_summary(payload: Dict[str, Any]) -> None:
             f"ObserverBreak={r['observer_confirmed_break']}"
         )
 
-    print("\n⚠️ VULNERABILITIES")
+    _safe_console_print("\n⚠️ VULNERABILITIES")
     for item in report["vulnerabilities_found"]:
-        print(f"• {item}")
+        _safe_console_print(f"• {item}")
 
-    print("\n💡 RECOMMENDATIONS")
+    _safe_console_print("\n💡 RECOMMENDATIONS")
     for item in report["recommendations"]:
-        print(f"• {item}")
+        _safe_console_print(f"• {item}")
 
     trend = report.get("trend")
     if trend:
-        print("\n📊 TREND ANALYSIS")
-        print(f"Attack Trend: {trend.get('attack_trend', 'N/A')}")
-        print(f"Defense Trend: {trend.get('defense_trend', 'N/A')}")
-        print(f"Compromise Velocity: {trend.get('compromise_velocity', 0):.2f} pts/turn")
-        print(f"Risk Acceleration: {trend.get('risk_acceleration', 0):.2f}")
+        _safe_console_print("\n📊 TREND ANALYSIS")
+        _safe_console_print(f"Attack Trend: {trend.get('attack_trend', 'N/A')}")
+        _safe_console_print(f"Defense Trend: {trend.get('defense_trend', 'N/A')}")
+        _safe_console_print(f"Compromise Velocity: {trend.get('compromise_velocity', 0):.2f} pts/turn")
+        _safe_console_print(f"Risk Acceleration: {trend.get('risk_acceleration', 0):.2f}")
         est = trend.get("estimated_break_turn")
         if est:
-            print(f"Estimated Break Turn: ~{est}")
+            _safe_console_print(f"Estimated Break Turn: ~{est}")
         else:
-            print("Estimated Break Turn: Not projected")
+            _safe_console_print("Estimated Break Turn: Not projected")
 
-    print("\n📦 JSON Export")
-    print(f"• {session['export_json_path']}")
-    print("=" * 84 + "\n")
+    _safe_console_print("\n📦 JSON Export")
+    _safe_console_print(f"• {session['export_json_path']}")
+    _safe_console_print("=" * 84 + "\n")
 
 
 # ============================================================
