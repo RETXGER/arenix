@@ -2,7 +2,9 @@
 
 > **Adaptive multi-turn LLM adversarial security testing and reporting framework.**
 
-| Python **3.11 / 3.12** | **Mock mode** (no API keys) | **JSON report export** | **Authorized testing only** |
+| Python | Mock mode | JSON export | Use |
+| --- | --- | --- | --- |
+| **3.11 / 3.12** | **Yes** | **Yes** (`arenix_report.json`) | **Authorized testing only** |
 
 [Arenix](https://github.com/RETXGER/arenix) runs an **Orchestrator** loop: configurable **attacker** and **target** models (including fully offline mocks) exchange prompts and replies over **multiple turns**. A rule-based/heuristic **analyzer** scores observable risk signals turn-by-turn and at session level (optionally supplemented by extra LLM calls when configured). Outputs are artifacts you can ingest into review workflows—not a verdict that replaces judgment.
 
@@ -40,7 +42,7 @@ Then open **`docs/sample_reports/mock_report.json`** for a committed, trimmed il
 
 The **core** simulation lives in [`arenix_engine.py`](arenix_engine.py): **`Orchestrator`**, role adapters (attacker/target/analyzer/observer), scoring, and JSON export.
 
-The repository also carries **optional** layers — **APO**, **Playwright**-related flows, **reconnaissance**, **validation / pipeline**, Streamlit **`ui/`** (root [`app.py`](app.py) loads `ui/app.py`), **`evidence/`**, **`reporting/`** — that you can ignore when you only need the CLI mock or basic LLM run.
+**Extended agent/browser/recon modules are not part of main.** The layout described here is the **main** tree: **`arenix_engine.py`**, CLI (`main_engine.py`), **`tests/`**, and optional root-level **`app.py`** (Streamlit) / **`api.py`** (FastAPI) entry points.
 
 ---
 
@@ -65,7 +67,7 @@ python main_engine.py
 
 python -m pytest -q
 
-# Dashboard (delegates to ui/app.py)
+# Runs the root-level Streamlit app.
 streamlit run app.py
 
 # REST API — requires FastAPI/uvicorn in the environment (see requirements.txt)
@@ -167,7 +169,7 @@ As of repository maintenance snapshots:
 
 | Item | Notes |
 |---|---|
-| **Automated tests** | `python -m pytest -q` — **24** tests passing locally/CI-aligned (analyzer, adapters, JSON export integrity, FastAPI validations, **`print_summary`** console encoding guards under strict `cp1254`-like streams). |
+| **Automated tests** | `python -m pytest -q` — pytest suite under **`tests/`** (analyzer, adapters, JSON export integrity, FastAPI validations, **`print_summary`** console encoding guards under strict `cp1254`-like streams). |
 | **CLI export** | `python main_engine.py` completes **`export_json`** without serialisation failures on **`raw_report`**. |
 | **Windows consoles** | `print_summary` uses a safe writer so **narrow code pages** (`cp1254`, etc.) do not raise **`UnicodeEncodeError`** on headings that contain emoji/markers—output may substitute replacement characters while the process exits successfully. |
 
@@ -199,9 +201,9 @@ CI runs on Push/PR workflows with Python **3.11** and **3.12** ([`.github/workfl
 |---|---|
 | `arenix_engine.py` | Orchestration, adapters, scoring, export, summaries |
 | `adaptive_attacker.py` | Adaptive tactics / feedback scaffolding |
-| `attack_library.py` | Payload tooling (selectors/mutators within extended paths) |
+| `attack_library.py` | Payload selectors / mutation helpers |
 | `main_engine.py` | Thin CLI wrapper |
-| `app.py` | Streamlit entry shim → **`ui/app.py`** |
+| `app.py` | Root-level **Streamlit** dashboard |
 | `api.py` | FastAPI façade (requires FastAPI stack) |
 
 ---
@@ -250,7 +252,7 @@ python -m pytest -q
 python -m pytest tests/ -v
 ```
 
-`tests/` plus root-level scenarios cover scoring heuristics, export round-trips, FastAPI validators, concurrency/error hygiene, terminal encoding regressions.
+`tests/` covers scoring heuristics, export round-trips, FastAPI validators, concurrency/error hygiene, terminal encoding regressions.
 
 ---
 
@@ -258,21 +260,20 @@ python -m pytest tests/ -v
 
 ```
 arenix/
-├── main_engine.py          # CLI shim
-├── app.py                   # Runs ui/app.py
+├── main_engine.py           # CLI entry
+├── app.py                   # Root-level Streamlit dashboard
 ├── arenix_engine.py         # Core engine
 ├── adaptive_attacker.py
 ├── attack_library.py
 ├── semantic_engine.py
 ├── api.py                   # REST (needs FastAPI/uvicorn)
-├── compliance_mapper.py     # Bridges into reporting.*
-├── report_generator.py
-├── tournament.py            # Separate extended tournament/APO tooling (not CLI core loop)
+├── compliance_mapper.py     # Root-level compliance mapping
+├── report_generator.py      # Root-level report generation
+├── tournament.py            # Tournament / APO-style tooling (separate from CLI core loop)
 ├── requirements.txt
 ├── .env.example             # Env reference ONLY — manual export needed
-├── tests/                   # 20+ focussed tests (+ shared scenarios)
-├── ui/                      # Streamlit dashboard
-├── evidence/, reporting/, validation/, recon/, …  # optional extended layers
+├── tests/
+├── docs/                    # Demo flow, sample reports, screenshots notes
 └── .github/workflows/tests.yml   # pytest on Python 3.11 + 3.12
 ```
 
