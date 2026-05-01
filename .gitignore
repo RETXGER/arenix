@@ -22,8 +22,12 @@ dist/
 .env.*
 !.env.example
 
+# Runtime / local logs (sessions, encrypted store, salts)
+logs/
+
 # Generated reports and validation artifacts
 *_report.json
+!docs/sample_reports/mock_report.json
 _*.json
 reports/
 *.log
